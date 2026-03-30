@@ -9,6 +9,7 @@ import os
 import sys
 import logging
 import winreg
+from logging.handlers import RotatingFileHandler
 from tkinter import Menu
 from cryptography.fernet import Fernet
 import queue
@@ -19,21 +20,26 @@ CONFIG_FILE = "aust_net_config.json"
 KEY_FILE = ".aust_net.key"
 LOGIN_URL = "http://10.255.0.19/drcom/login"
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('aust_login.log', encoding='utf-8'),
-        logging.StreamHandler()
-    ]
-)
+logger = logging.getLogger("AUST_NetKeeper")
+logger.setLevel(logging.INFO)
+_fmt = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+
+_file_handler = RotatingFileHandler('aust_login.log', maxBytes=5*1024*1024, backupCount=3, encoding='utf-8')
+_file_handler.setFormatter(_fmt)
+logger.addHandler(_file_handler)
+
+_console_handler = logging.StreamHandler()
+_console_handler.setFormatter(_fmt)
+logger.addHandler(_console_handler)
+
 
 class ConfigManager:
     def __init__(self, config_file):
         self.config_file = config_file
         self.fernet = self._get_fernet()
         self.config = self.load()
-    
+        self.corrupted = False  # 标记配置是否因损坏而重置
+
     def _get_fernet(self):
         if os.path.exists(KEY_FILE):
             with open(KEY_FILE, "rb") as f:
@@ -42,19 +48,10 @@ class ConfigManager:
             key = Fernet.generate_key()
             with open(KEY_FILE, "wb") as f:
                 f.write(key)
-            logging.info("生成新的加密密钥")
+            logger.info("生成新的加密密钥")
         return Fernet(key)
-    
-    def load(self):
-        if os.path.exists(self.config_file):
-            try:
-                with open(self.config_file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    if "password" in data and data["password"]:
-                        data["password"] = self._decrypt(data["password"])
-                    return data
-            except Exception as e:
-                logging.error(f"加载配置失败: {e}")
+
+    def _default_config(self):
         return {
             "username": "",
             "password": "",
@@ -63,29 +60,46 @@ class ConfigManager:
             "reconnect_interval": 5,
             "check_interval": 30
         }
-    
+
+    def load(self):
+        if os.path.exists(self.config_file):
+            try:
+                with open(self.config_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if "password" in data and data["password"]:
+                        data["password"] = self._decrypt(data["password"])
+                    return data
+            except json.JSONDecodeError as e:
+                logger.error(f"配置文件格式损坏，已重置为默认配置: {e}")
+                self.corrupted = True
+            except Exception as e:
+                logger.error(f"加载配置失败，已重置为默认配置: {e}")
+                self.corrupted = True
+        return self._default_config()
+
     def save(self, config):
         config_copy = config.copy()
         if "password" in config_copy and config_copy["password"]:
             config_copy["password"] = self._encrypt(config_copy["password"])
-        
+
         try:
             with open(self.config_file, "w", encoding="utf-8") as f:
                 json.dump(config_copy, f, ensure_ascii=False, indent=2)
             self.config = config
             return True
         except Exception as e:
-            logging.error(f"保存配置失败: {e}")
+            logger.error(f"保存配置失败: {e}")
             return False
-    
+
     def _encrypt(self, text):
         return self.fernet.encrypt(text.encode()).decode()
-    
+
     def _decrypt(self, text):
         try:
             return self.fernet.decrypt(text.encode()).decode()
         except Exception:
             return text
+
 
 def create_tray_icon_image():
     # 生成一个简单的蓝色图标，打包成 exe 后可在任务栏托盘显示
@@ -96,21 +110,22 @@ def create_tray_icon_image():
     draw.rectangle([24, 30, 40, 34], fill='#2196F3')
     return image
 
+
 class AutoLoginApp:
     def __init__(self, root):
         self.root = root
         self.root.title("AUST 校园网守护者")
         self.root.geometry("450x520")
         self.root.resizable(False, False)
-        
+
         self.is_running = False
         self.thread = None
         self.stop_event = threading.Event()
         self.tray_icon = None
         self.log_queue = queue.Queue()
-        
+
         self.config_manager = ConfigManager(CONFIG_FILE)
-        
+
         # 严格按照网关源码扒出的真实出口暗号
         self.isp_map = {
             "学生电信出口 (@aust)": "@aust",
@@ -122,66 +137,69 @@ class AutoLoginApp:
         self.create_widgets()
         self.load_config()
         self.update_log_from_queue()
-    
+
     def create_widgets(self):
         title_frame = tk.Frame(self.root)
         title_frame.pack(pady=(15, 10))
         tk.Label(title_frame, text="AUST 校园网守护者", font=("微软雅黑", 14, "bold")).pack()
-        
+
         input_frame = tk.Frame(self.root)
         input_frame.pack(pady=10)
-        
+
         tk.Label(input_frame, text="学号 (纯数字):").grid(row=0, column=0, sticky=tk.W, pady=8)
         self.entry_user = tk.Entry(input_frame, width=28)
         self.entry_user.grid(row=0, column=1, pady=8)
-        
+
         tk.Label(input_frame, text="密码:").grid(row=1, column=0, sticky=tk.W, pady=8)
         self.entry_pwd = tk.Entry(input_frame, width=28, show="*")
         self.entry_pwd.grid(row=1, column=1, pady=8)
-        
+
         tk.Label(input_frame, text="网络出口:").grid(row=2, column=0, sticky=tk.W, pady=8)
         self.isp_var = tk.StringVar()
         self.isp_combo = ttk.Combobox(input_frame, textvariable=self.isp_var, state="readonly", width=26)
         self.isp_combo['values'] = list(self.isp_map.keys())
         self.isp_combo.current(0)
         self.isp_combo.grid(row=2, column=1, pady=8)
-        
+
         settings_frame = tk.LabelFrame(self.root, text="高级设置", padx=10, pady=5)
         settings_frame.pack(pady=5, padx=20, fill="x")
-        
+
         tk.Label(settings_frame, text="重连间隔(秒):").grid(row=0, column=0, sticky=tk.W, pady=5)
         self.reconnect_interval_var = tk.IntVar(value=5)
         tk.Entry(settings_frame, textvariable=self.reconnect_interval_var, width=8).grid(row=0, column=1, pady=5, padx=5)
-        
-        tk.Label(settings_frame, text="检测间隔(秒):").grid(row=0, column=2, sticky=tk.W, pady=5, padx=(20,0))
+
+        tk.Label(settings_frame, text="检测间隔(秒):").grid(row=0, column=2, sticky=tk.W, pady=5, padx=(20, 0))
         self.check_interval_var = tk.IntVar(value=30)
         tk.Entry(settings_frame, textvariable=self.check_interval_var, width=8).grid(row=0, column=3, pady=5, padx=5)
-        
+
         self.auto_run_var = tk.BooleanVar()
         tk.Checkbutton(input_frame, text="开机静默启动 (最小化到托盘)", variable=self.auto_run_var).grid(row=4, columnspan=2, pady=10)
-        
+
         btn_frame = tk.Frame(self.root)
         btn_frame.pack(pady=15)
-        
-        self.btn_start = tk.Button(btn_frame, text="▶ 开始运行", bg="lightgreen", width=12, font=("微软雅黑", 10), command=self.start_monitor)
-        self.btn_start.pack(side=tk.LEFT, padx=10)
-        
-        self.btn_stop = tk.Button(btn_frame, text="⏹ 停止运行", bg="salmon", width=12, font=("微软雅黑", 10), state=tk.DISABLED, command=self.stop_monitor)
-        self.btn_stop.pack(side=tk.LEFT, padx=10)
-        
-        self.btn_clear = tk.Button(btn_frame, text="🗑 清空日志", bg="lightblue", width=10, font=("微软雅黑", 9), command=self.clear_log)
-        self.btn_clear.pack(side=tk.LEFT, padx=10)
-        
+
+        self.btn_start = tk.Button(btn_frame, text="▶ 开始运行", bg="lightgreen", width=10, font=("微软雅黑", 10), command=self.start_monitor)
+        self.btn_start.pack(side=tk.LEFT, padx=5)
+
+        self.btn_stop = tk.Button(btn_frame, text="⏹ 停止运行", bg="salmon", width=10, font=("微软雅黑", 10), state=tk.DISABLED, command=self.stop_monitor)
+        self.btn_stop.pack(side=tk.LEFT, padx=5)
+
+        self.btn_minimize = tk.Button(btn_frame, text="📎 最小化", width=9, font=("微软雅黑", 9), command=self.minimize_to_tray)
+        self.btn_minimize.pack(side=tk.LEFT, padx=5)
+
+        self.btn_clear = tk.Button(btn_frame, text="🗑 清空日志", bg="lightblue", width=9, font=("微软雅黑", 9), command=self.clear_log)
+        self.btn_clear.pack(side=tk.LEFT, padx=5)
+
         self.status_var = tk.StringVar(value="就绪")
         self.status_label = tk.Label(self.root, textvariable=self.status_var, font=("微软雅黑", 10), fg="#666")
         self.status_label.pack(pady=5)
-        
+
         tk.Label(self.root, text="运行日志:", font=("微软雅黑", 9)).pack()
         self.log_area = scrolledtext.ScrolledText(self.root, width=48, height=10, state=tk.DISABLED, bg="#f5f5f5", font=("Consolas", 9))
         self.log_area.pack(pady=5, padx=10)
-        
+
         self.create_menu()
-    
+
     def create_menu(self):
         menubar = Menu(self.root)
         self.root.config(menu=menubar)
@@ -191,10 +209,10 @@ class AutoLoginApp:
         file_menu.add_command(label="最小化到托盘", command=self.minimize_to_tray)
         file_menu.add_separator()
         file_menu.add_command(label="完全退出", command=self.quit_app)
-    
+
     def log(self, message):
         self.log_queue.put(message)
-    
+
     def update_log_from_queue(self):
         try:
             while True:
@@ -207,37 +225,54 @@ class AutoLoginApp:
         except queue.Empty:
             pass
         self.root.after(100, self.update_log_from_queue)
-    
+
     def clear_log(self):
         self.log_area.config(state=tk.NORMAL)
         self.log_area.delete(1.0, tk.END)
         self.log_area.config(state=tk.DISABLED)
-    
+
+    def _tray_notify(self, title, message):
+        """系统托盘气泡通知，托盘未创建或不支持时静默跳过"""
+        if self.tray_icon:
+            try:
+                self.tray_icon.notify(title, message)
+            except Exception:
+                pass
+
+    def _unlock_ui(self):
+        """恢复 UI 控件到可编辑状态（必须从主线程调用）"""
+        self.is_running = False
+        self.btn_start.config(state=tk.NORMAL)
+        self.btn_stop.config(state=tk.DISABLED)
+        self.entry_user.config(state=tk.NORMAL)
+        self.entry_pwd.config(state=tk.NORMAL)
+        self.isp_combo.config(state=tk.NORMAL)
+
     def validate_input(self):
         user = self.entry_user.get().strip()
         password = self.entry_pwd.get().strip()
-        
+
         if not user or not user.isdigit():
             messagebox.showwarning("提示", "学号必须填写且只能为纯数字！")
             return None
         if not password:
             messagebox.showwarning("提示", "请输入密码！")
             return None
-        
+
         try:
             reconnect = self.reconnect_interval_var.get()
             check = self.check_interval_var.get()
         except Exception:
             messagebox.showwarning("提示", "高级设置中的时间间隔必须是有效的数字！")
             return None
-            
+
         if reconnect < 1 or reconnect > 60:
             messagebox.showwarning("提示", "重连间隔应在1-60秒之间！")
             return None
         if check < 5 or check > 300:
             messagebox.showwarning("提示", "检测间隔应在5-300秒之间！")
             return None
-        
+
         return {
             "username": user,
             "password": password,
@@ -246,9 +281,13 @@ class AutoLoginApp:
             "reconnect_interval": reconnect,
             "check_interval": check
         }
-    
+
     def load_config(self):
         config = self.config_manager.config
+
+        if self.config_manager.corrupted:
+            logger.warning("配置文件已损坏，已重置为默认配置")
+
         self.entry_user.insert(0, config.get("username", ""))
         self.entry_pwd.insert(0, config.get("password", ""))
         saved_isp = config.get("isp", "学生电信出口 (@aust)")
@@ -257,12 +296,15 @@ class AutoLoginApp:
         self.auto_run_var.set(config.get("auto_run", False))
         self.reconnect_interval_var.set(config.get("reconnect_interval", 5))
         self.check_interval_var.set(config.get("check_interval", 30))
-        
+
+        if self.config_manager.corrupted:
+            self.status_var.set("⚠ 配置文件已损坏，已重置为默认")
+
         # 如果设置了开机自启，启动时尝试自动开始监控（并可配合启动参数直接最小化）
         if self.auto_run_var.get() and config.get("username") and config.get("password"):
             # 延迟 2 秒启动，确保系统网络模块已加载完毕
             self.root.after(2000, self.start_monitor)
-    
+
     def apply_auto_run_to_system(self, enable):
         """完全合规的系统注册表读写，实现静默开机自启"""
         try:
@@ -270,7 +312,7 @@ class AutoLoginApp:
                 app_path = sys.executable
             else:
                 app_path = os.path.abspath(__file__)
-                
+
             key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_ALL_ACCESS)
             if enable:
                 winreg.SetValueEx(key, "AUST_NetKeeper", 0, winreg.REG_SZ, f'"{app_path}" -autorun')
@@ -278,10 +320,10 @@ class AutoLoginApp:
                 try:
                     winreg.DeleteValue(key, "AUST_NetKeeper")
                 except FileNotFoundError:
-                    pass 
+                    pass
             winreg.CloseKey(key)
         except Exception as e:
-            logging.error(f"设置开机自启失败: {e}")
+            logger.error(f"设置开机自启失败: {e}")
             self.log("警告: 开机自启设置可能被安全软件拦截，请手动放行。")
 
     def save_config(self, validated_data):
@@ -295,16 +337,16 @@ class AutoLoginApp:
         }
         self.apply_auto_run_to_system(validated_data["auto_run"])
         return self.config_manager.save(config)
-    
+
     def check_internet(self):
-        """终极优化版：使用 Dr.COM 官方 API 进行毫秒级状态检测"""
+        """使用 Dr.COM 官方 API 进行毫秒级状态检测"""
         status_url = "http://10.255.0.19/drcom/chkstatus"
         params = {"callback": "dr1002"}
         try:
             # 局域网请求极其迅速，超时设为1秒，彻底释放系统资源
             response = requests.get(status_url, params=params, timeout=1)
             response.encoding = 'utf-8'
-            
+
             # 分析网关底层返回特征码
             if '"result":1' in response.text or '"time":' in response.text:
                 return True
@@ -313,7 +355,44 @@ class AutoLoginApp:
         except requests.RequestException:
             # 捕获局域网断开异常（如拔掉网线）
             return False
-    
+
+    def _parse_jsonp(self, response_text):
+        """剥离 JSONP 回调包装（如 dr1003({...})），返回解析后的 dict"""
+        text = response_text.strip()
+        try:
+            start = text.index('(') + 1
+            end = text.rindex(')')
+            return json.loads(text[start:end])
+        except (ValueError, json.JSONDecodeError) as e:
+            logger.error(f"网关响应解析失败: {e} | 原始内容: {text[:200]}")
+            return None
+
+    def _get_gateway_error_msg(self, data):
+        """从网关返回中提取人类可读的错误原因"""
+        # Dr.COM 网关常见错误码映射
+        error_map = {
+            0: "登录失败（密码错误或账号不存在）",
+            1: "登录成功",
+            2: "账号已欠费，请充值",
+            3: "账号已停机",
+            4: "在线人数已达上限",
+            5: "该账号不允许在此IP段登录",
+            7: "账号不存在",
+            9: "认证服务器繁忙",
+            10: "账号余额不足",
+            11: "MAC地址绑定不匹配",
+            12: "VLAN ID 不匹配",
+            13: "不在允许的VLAN范围内",
+        }
+        result = data.get("result")
+        if result is not None and result in error_map:
+            return error_map[result]
+        # 兜底：尝试返回 msg 字段
+        msg = data.get("msg") or data.get("message")
+        if msg:
+            return str(msg)
+        return f"未知错误（result={result}）"
+
     def login_gateway(self, full_username, password):
         params = {
             "callback": "dr1003",
@@ -327,54 +406,93 @@ class AutoLoginApp:
         }
         try:
             response = requests.get(LOGIN_URL, params=params, headers=headers, timeout=5)
-            if response.status_code == 200:
-                self.log("向网关发射认证请求成功！")
-                self.status_var.set("认证中...")
+            response.encoding = 'utf-8'
+
+            if response.status_code != 200:
+                self.log(f"网关拒绝请求: HTTP {response.status_code}")
+                return False
+
+            data = self._parse_jsonp(response.text)
+            if data is None:
+                self.log("网关返回了无法解析的响应")
+                return False
+
+            if data.get("result") == 1:
+                self.log("登录成功，已通过网关认证！")
                 return True
             else:
-                self.log(f"网关拒绝请求: {response.status_code}")
+                reason = self._get_gateway_error_msg(data)
+                self.log(f"登录失败: {reason}")
                 return False
-        except Exception as e:
-            self.log(f"网络通信故障: {e}")
+
+        except requests.exceptions.Timeout:
+            self.log("网关响应超时（5秒内无应答）")
             return False
-    
+        except requests.exceptions.ConnectionError:
+            self.log("无法连接到网关（网线断开或网关不可达）")
+            return False
+        except Exception as e:
+            self.log(f"网络通信异常: {e}")
+            return False
+
+    def _interruptible_sleep(self, seconds):
+        """可被 stop_event 立即中断的 sleep，避免停止按钮卡顿"""
+        self.stop_event.wait(timeout=seconds)
+
     def monitor_loop(self, full_username, password, reconnect_interval, check_interval):
+        was_online = True  # 初始假设已在线，避免启动时误报
+        consecutive_failures = 0  # 连续登录失败计数
         self.log(f"守护引擎已启动 | 账号: {full_username.split('@')[0]}***")
         self.log(f"官方 API 探测频率: {check_interval} 秒/次")
-        
+
         while not self.stop_event.is_set():
             try:
-                if not self.check_internet():
-                    self.log("警报: 网关连接掉线，正在极速重连...")
+                online = self.check_internet()
+                if not online:
+                    if was_online:
+                        self.log("警报: 网关连接掉线，正在重连...")
+                        self._tray_notify("AUST 校园网守护者", "⚠ 网络已断开，正在尝试重连...")
                     self.status_var.set("正在重连...")
-                    self.login_gateway(full_username, password)
-                    
+                    success = self.login_gateway(full_username, password)
+
+                    if success:
+                        self._tray_notify("AUST 校园网守护者", "✅ 网络重连成功！")
+                        consecutive_failures = 0
+                    else:
+                        consecutive_failures += 1
+                        if consecutive_failures >= 3:
+                            self.log("连续 3 次登录失败，自动停止守护（请检查账号密码）")
+                            self._tray_notify("AUST 校园网守护者", "❌ 连续登录失败，请检查账号密码")
+                            self.status_var.set("已停止（连续失败）")
+                            self.root.after(0, self._unlock_ui)
+                            return
+                    was_online = online
+
                     # 重连后的冷却时间
-                    for _ in range(reconnect_interval):
-                        if self.stop_event.is_set():
-                            break
-                        time.sleep(1)
+                    self._interruptible_sleep(reconnect_interval)
                 else:
+                    if not was_online:
+                        self.log("网络连接已恢复")
+                        self._tray_notify("AUST 校园网守护者", "✅ 网络已恢复正常")
                     self.status_var.set("🟢 已连接")
-                
+                    was_online = True
+                    consecutive_failures = 0
+
                 # 正常状态下的探测休眠周期
-                for _ in range(check_interval):
-                    if self.stop_event.is_set():
-                        break
-                    time.sleep(1)
-                    
+                self._interruptible_sleep(check_interval)
+
             except Exception as e:
-                logging.error(f"引擎异常: {e}")
-                time.sleep(5)
-        
+                logger.error(f"引擎异常: {e}")
+                self._interruptible_sleep(5)
+
         self.log("守护引擎已安全关闭")
         self.status_var.set("已停止")
-    
+
     def start_monitor(self):
         # 防止重复启动
         if self.is_running:
             return
-            
+
         validated = self.validate_input()
         if not validated:
             return
@@ -384,14 +502,14 @@ class AutoLoginApp:
 
         if not self.save_config(validated):
             messagebox.showwarning("提示", "配置文件保存失败！")
-        
+
         self.btn_start.config(state=tk.DISABLED)
         self.btn_stop.config(state=tk.NORMAL)
         self.entry_user.config(state=tk.DISABLED)
         self.entry_pwd.config(state=tk.DISABLED)
         self.isp_combo.config(state=tk.DISABLED)
         self.status_var.set("启动中...")
-        
+
         self.is_running = True
         self.stop_event.clear()
         self.thread = threading.Thread(
@@ -400,18 +518,14 @@ class AutoLoginApp:
             daemon=True
         )
         self.thread.start()
-    
+
     def stop_monitor(self):
-        self.is_running = False
         self.stop_event.set()
         self.log("正在刹车，安全退出监控队列...")
-        
-        self.btn_start.config(state=tk.NORMAL)
-        self.btn_stop.config(state=tk.DISABLED)
-        self.entry_user.config(state=tk.NORMAL)
-        self.entry_pwd.config(state=tk.NORMAL)
-        self.isp_combo.config(state=tk.NORMAL)
-    
+
+        # 恢复 UI（不阻塞主线程，不等线程退出）
+        self._unlock_ui()
+
     def minimize_to_tray(self):
         self.root.withdraw()
         if self.tray_icon is None:
@@ -424,34 +538,35 @@ class AutoLoginApp:
                 self.tray_icon = pystray.Icon("AUST_Login", image, "AUST校园网守护者", menu)
                 self.tray_icon.run_detached()
             except Exception as e:
-                logging.error(f"系统托盘创建失败: {e}")
+                logger.error(f"系统托盘创建失败: {e}")
                 self.root.deiconify()
-    
+
     def show_window(self):
         if self.tray_icon:
             self.tray_icon.stop()
             self.tray_icon = None
         self.root.after(0, self.root.deiconify)
-        self.root.focus_force() # 强行调出置顶
-    
+        self.root.focus_force()  # 强行调出置顶
+
     def quit_app(self):
         if self.is_running:
-            self.stop_monitor()
+            self.stop_event.set()
         if self.tray_icon:
             self.tray_icon.stop()
         self.root.quit()
 
+
 if __name__ == "__main__":
     root = tk.Tk()
     app = AutoLoginApp(root)
-    
+
     # 拦截右上角 X 按钮，改为静默后台
     root.protocol("WM_DELETE_WINDOW", app.minimize_to_tray)
-    
+
     # 解析命令行参数：如果注册表带了 -autorun 启动，则直接隐藏窗口进入托盘
     if len(sys.argv) > 1 and sys.argv[1] == "-autorun":
         root.withdraw()
         # 延迟1秒创建托盘，防止系统启动初期UI渲染失败
         root.after(1000, app.minimize_to_tray)
-        
+
     root.mainloop()
